@@ -1,0 +1,166 @@
+<?php
+
+namespace Ernestdefoe\Phrasebook\Api;
+
+use Ernestdefoe\Phrasebook\Provider\Catalog;
+use Ernestdefoe\Phrasebook\Provider\Job;
+use Ernestdefoe\Phrasebook\Provider\Pricing;
+use Ernestdefoe\Phrasebook\Run\Estimator;
+use Ernestdefoe\Phrasebook\Run\Run;
+use Ernestdefoe\Phrasebook\Run\Runs;
+use Ernestdefoe\Phrasebook\Settings\Settings;
+use Ernestdefoe\Phrasebook\Settings\Vault;
+use Ernestdefoe\Phrasebook\Strings\Languages;
+use Ernestdefoe\Phrasebook\Strings\Scanner;
+use Flarum\Foundation\ValidationException;
+use Flarum\Http\RequestUtil;
+use Psr\Http\Message\ServerRequestInterface;
+
+/**
+ * Estimates (dry: true) or starts a run for each chosen locale.
+ */
+class StartController extends Controller
+{
+    public function __construct(
+        private readonly Scanner $scanner,
+        private readonly Runs $runs,
+        private readonly Pricing $pricing,
+        private readonly Settings $settings,
+        private readonly Vault $vault
+    ) {
+    }
+
+    protected function respond(ServerRequestInterface $request): mixed
+    {
+        $locales = array_map(fn ($l) => $this->locale($l), $this->strings($this->input($request, 'locales'), 20));
+        $namespaces = $this->namespaces($this->input($request, 'namespaces'), $locales);
+        $reasons = array_values(array_intersect($this->strings($this->input($request, 'reasons')), Scanner::REASONS));
+        $provider = (string) $this->input($request, 'provider', '');
+        $model = trim((string) $this->input($request, 'model', ''));
+        $tone = (string) $this->input($request, 'tone', 'neutral');
+        $notes = trim((string) $this->input($request, 'notes', ''));
+        $glossary = trim((string) $this->input($request, 'glossary', ''));
+        $budget = $this->input($request, 'budget');
+        $dry = (bool) $this->input($request, 'dry', false);
+
+        $def = Catalog::get($provider);
+
+        $errors = array_filter([
+            'locales' => $locales === [] ? 'required' : null,
+            'reasons' => $reasons === [] ? 'required' : null,
+            'provider' => $def === null ? 'invalid' : null,
+            'model' => $model === '' || strlen($model) > 191 || preg_match('/[\x00-\x1f\x7f]/', $model) ? 'invalid' : null,
+            'tone' => in_array($tone, ['formal', 'informal', 'neutral'], true) ? null : 'invalid',
+            'notes' => mb_strlen($notes) > 1000 ? 'too_long' : null,
+            'glossary' => mb_strlen($glossary) > 10000 ? 'too_long' : null,
+        ]);
+
+        if ($errors) {
+            throw new ValidationException($errors);
+        }
+
+        $price = $this->pricing->for($provider, $model);
+        $template = new Job([], $locales[0], Languages::name($locales[0]), $model, $tone, $notes, Settings::glossary($glossary), 0);
+        $plans = [];
+
+        foreach ($locales as $locale) {
+            $strings = $this->scanner->scan($locale, $reasons, $namespaces[$locale]);
+            $sources = array_map(fn ($row) => $row['source'], $strings);
+            $plans[$locale] = [
+                'strings' => $strings,
+                'estimate' => Estimator::dryRun($sources, $this->settings->batchSize(), $def['kind'], $price, $template),
+            ];
+        }
+
+        if ($dry) {
+            return [
+                'price' => $price,
+                'locales' => array_map(fn ($plan) => $plan['estimate'], $plans),
+            ];
+        }
+
+        if ($price === null) {
+            throw new ValidationException(['price' => 'required']);
+        }
+
+        if ($def['key'] === 'required' && $this->vault->get($provider) === null) {
+            throw new ValidationException(['key' => 'required']);
+        }
+
+        if (! is_numeric($budget) || (float) $budget < 0 || (float) $budget > 10000 || ((float) $budget <= 0 && (($price['in'] ?? 0) + ($price['out'] ?? 0) + ($price['char'] ?? 0)) > 0)) {
+            throw new ValidationException(['budget' => 'invalid']);
+        }
+
+        // One open run per language: a second would translate the same
+        // strings again while the first still waits for review.
+        foreach ($locales as $locale) {
+            $open = Run::query()->where('locale', $locale)->where(fn ($q) => $q
+                ->whereIn('status', [...Run::ACTIVE, 'paused'])
+                ->orWhere(fn ($q) => $q->whereIn('status', ['review', 'cancelled'])->whereExists(fn ($q) => $q
+                    ->selectRaw('1')
+                    ->from('phrasebook_items')
+                    ->whereColumn('phrasebook_items.run_id', 'phrasebook_runs.id')
+                    ->whereIn('phrasebook_items.status', ['pending', 'translated', 'accepted', 'failed']))))
+                ->exists();
+
+            if ($open) {
+                throw new ValidationException(['locales' => 'run_active']);
+            }
+        }
+
+        $started = [];
+        $actor = RequestUtil::getActor($request);
+
+        foreach ($plans as $locale => $plan) {
+            if ($plan['strings'] === []) {
+                continue;
+            }
+
+            $this->settings->saveStyle($locale, ['tone' => $tone, 'notes' => $notes, 'glossary' => $glossary]);
+
+            $run = $this->runs->start($locale, $plan['strings'], [
+                'provider' => $provider,
+                'model' => $model,
+                'budget' => round((float) $budget, 4),
+                'tone' => $tone,
+                'notes' => $notes,
+                'glossary' => $glossary,
+            ], $actor->id);
+
+            $started[] = self::present($run);
+        }
+
+        if ($started === []) {
+            throw new ValidationException(['strings' => 'nothing_to_translate']);
+        }
+
+        return ['runs' => $started, 'queued' => $this->runs->queued()];
+    }
+
+    /**
+     * The extensions to translate, per locale: one list for every locale, or
+     * {locale: list} as the admin page sends it, where each language has its
+     * own ticks. Null means all of them.
+     *
+     * @param list<string> $locales
+     *
+     * @return array<string, list<string>|null>
+     */
+    private function namespaces(mixed $value, array $locales): array
+    {
+        if (! is_array($value) || array_is_list($value)) {
+            return array_fill_keys($locales, is_array($value) ? $this->strings($value) : null);
+        }
+
+        $out = array_fill_keys($locales, null);
+
+        foreach (array_slice($value, 0, 20, true) as $locale => $list) {
+            $locale = $this->locale((string) $locale);
+            if (array_key_exists($locale, $out)) {
+                $out[$locale] = is_array($list) ? $this->strings($list) : null;
+            }
+        }
+
+        return $out;
+    }
+}
